@@ -11,6 +11,8 @@ import streamlit as st
 from road_speed_map.config import MAP_PRESETS, SPEED_COLORS, SPEED_LEGEND
 from road_speed_map.display import merge_contiguous_segments
 from road_speed_map.jartic import JarticError, fetch_jartic_snapshot, load_jartic_speed_features
+from road_speed_map.map_component import maplibre_editor
+from road_speed_map.maplibre import apply_map_edit, encode_map_payload
 from road_speed_map.matching import match_jartic_to_segments
 from road_speed_map.osm import OverpassError, bbox_tiles, fetch_overpass_snapshot, load_segments
 from road_speed_map.overrides import OverrideStore
@@ -29,6 +31,10 @@ ROAD_LAYER_ID = "road-segments"
 INFERRED_ROAD_LAYER_ID = "inferred-road-segments"
 JARTIC_LINE_LAYER_ID = "jartic-speed-lines"
 JARTIC_ZONE_LAYER_ID = "jartic-speed-zones"
+MAPLIBRE_COMPONENT_KEY = "maplibre-road-editor"
+MAPLIBRE_PENDING_EDIT_KEY = "maplibre-pending-edit"
+MAPLIBRE_DISPLAY_GROUPS_KEY = "maplibre-display-groups"
+MAPLIBRE_NOTICE_KEY = "maplibre-notice"
 MAP_ROW_FIELDS = {
     "segment_id",
     "path",
@@ -38,6 +44,18 @@ MAP_ROW_FIELDS = {
 
 
 st.set_page_config(page_title="道路最高速度マップ", page_icon="🛣️", layout="wide")
+
+
+def queue_maplibre_edit() -> None:
+    """コンポーネントの保存通知を、次の本体実行で処理できるよう退避する。"""
+    component_state = st.session_state.get(MAPLIBRE_COMPONENT_KEY)
+    payload = (
+        component_state.get("save")
+        if isinstance(component_state, dict)
+        else getattr(component_state, "save", None)
+    )
+    if payload:
+        st.session_state[MAPLIBRE_PENDING_EDIT_KEY] = dict(payload)
 
 
 @st.cache_data(show_spinner=False)
@@ -527,6 +545,15 @@ def main() -> None:
             st.caption(f"OpenStreetMap取得単位: {tile_count} 分割")
         if preset.note:
             st.warning(preset.note)
+        maplibre_requested = st.toggle(
+            "高速編集地図（試作）",
+            value=preset_name == "札幌市周辺",
+            disabled=preset_name != "札幌市周辺",
+            help=(
+                "道路クリック時は再描画せず、地図上のフォームを開きます。"
+                "現在は札幌市周辺だけで利用できます。"
+            ),
+        )
         st.divider()
         st.header("描画モード")
         drawing_mode = st.radio(
@@ -601,6 +628,10 @@ def main() -> None:
             mime="text/csv",
         )
 
+    use_maplibre = maplibre_requested and preset_name == "札幌市周辺" and not show_jartic
+    if maplibre_requested and show_jartic:
+        st.info("JARTIC配布元の検証線を表示中は、従来のPyDeck地図へ切り替えます。")
+
     using_prepared_dataset = bool(preset.prepared_dataset)
     if preset.prepared_dataset:
         dataset = ROOT / preset.prepared_dataset
@@ -640,6 +671,14 @@ def main() -> None:
             st.info("しばらく待って再取得するか、別の表示範囲を選択してください。")
             st.stop()
 
+    pending_edit = st.session_state.pop(MAPLIBRE_PENDING_EDIT_KEY, None)
+    if pending_edit:
+        representative_id = str(pending_edit.get("segment_id") or "")
+        groups = st.session_state.get(MAPLIBRE_DISPLAY_GROUPS_KEY, {})
+        target_ids = groups.get(representative_id, [representative_id])
+        saved_count, message = apply_map_edit(store, segments, target_ids, pending_edit)
+        st.session_state[MAPLIBRE_NOTICE_KEY] = ("success" if saved_count else "error", message)
+
     jartic_lines: list[dict[str, Any]] = []
     jartic_areas: list[dict[str, Any]] = []
     jartic_metadata: dict[str, str] = {}
@@ -652,14 +691,17 @@ def main() -> None:
     except JarticError as exc:
         st.warning(f"JARTICデータは利用できません: {exc}")
 
+    override_mapping = store.as_mapping()
+    observation_mapping = store.observations_mapping()
+
     if using_prepared_dataset:
         jartic_match_count = sum(row.get("basis") == "jartic" for row in segments)
         base_rows = segments if include_inference else source_data_only(segments)
         enriched = (
             apply_human_knowledge(
                 base_rows,
-                store.as_mapping(),
-                store.observations_mapping(),
+                override_mapping,
+                observation_mapping,
             )
             if include_manual
             else base_rows
@@ -672,8 +714,8 @@ def main() -> None:
         enriched = (
             apply_human_knowledge(
                 base_rows,
-                store.as_mapping(),
-                store.observations_mapping(),
+                override_mapping,
+                observation_mapping,
             )
             if include_manual
             else base_rows
@@ -734,53 +776,78 @@ def main() -> None:
     display_groups = {
         row["segment_id"]: row.get("segment_ids", [row["segment_id"]]) for row in display_rows
     }
-    deck = render_deck(
-        compact_map_rows(display_rows),
-        selected_id,
-        displayed_lines,
-        displayed_areas,
-        preset.center,
-        preset.zoom,
-    )
-    event = st.pydeck_chart(
-        deck,
-        on_select="rerun",
-        selection_mode="single-object",
-        key="road-speed-map",
-        height=650,
-    )
-    selected_layer, clicked = selected_object(event)
-    if clicked and selected_layer in {ROAD_LAYER_ID, INFERRED_ROAD_LAYER_ID}:
-        st.session_state.selected_segment_id = clicked["segment_id"]
-        st.session_state.selected_segment_ids = display_groups.get(
-            clicked["segment_id"], [clicked["segment_id"]]
+    if use_maplibre:
+        st.session_state[MAPLIBRE_DISPLAY_GROUPS_KEY] = display_groups
+        notice = st.session_state.pop(MAPLIBRE_NOTICE_KEY, None)
+        if notice:
+            notice_kind, notice_text = notice
+            (st.success if notice_kind == "success" else st.error)(notice_text)
+        with st.spinner("高速編集地図を準備しています…"):
+            payload = encode_map_payload(
+                display_rows,
+                center=preset.center,
+                zoom=preset.zoom,
+                overrides=override_mapping,
+                observations=observation_mapping,
+            )
+        maplibre_editor(
+            data=payload,
+            key=MAPLIBRE_COMPONENT_KEY,
+            on_save_change=queue_maplibre_edit,
+            height=650,
         )
-        st.session_state.selected_jartic_id = None
-        selected_id = clicked["segment_id"]
-    elif clicked and selected_layer in {JARTIC_LINE_LAYER_ID, JARTIC_ZONE_LAYER_ID}:
-        st.session_state.selected_jartic_id = clicked["jartic_id"]
-        st.session_state.selected_segment_id = None
-        st.session_state.selected_segment_ids = []
-        selected_id = None
+        st.caption(
+            "試作版: 道路クリックでは再描画せず、地図上に補正フォームを開きます。"
+            "「保存して反映」または削除を押したときだけ再描画します。"
+        )
+    else:
+        deck = render_deck(
+            compact_map_rows(display_rows),
+            selected_id,
+            displayed_lines,
+            displayed_areas,
+            preset.center,
+            preset.zoom,
+        )
+        event = st.pydeck_chart(
+            deck,
+            on_select="rerun",
+            selection_mode="single-object",
+            key="road-speed-map",
+            height=650,
+        )
+        selected_layer, clicked = selected_object(event)
+        if clicked and selected_layer in {ROAD_LAYER_ID, INFERRED_ROAD_LAYER_ID}:
+            st.session_state.selected_segment_id = clicked["segment_id"]
+            st.session_state.selected_segment_ids = display_groups.get(
+                clicked["segment_id"], [clicked["segment_id"]]
+            )
+            st.session_state.selected_jartic_id = None
+            selected_id = clicked["segment_id"]
+        elif clicked and selected_layer in {JARTIC_LINE_LAYER_ID, JARTIC_ZONE_LAYER_ID}:
+            st.session_state.selected_jartic_id = clicked["jartic_id"]
+            st.session_state.selected_segment_id = None
+            st.session_state.selected_segment_ids = []
+            selected_id = None
 
-    selected_jartic_id = st.session_state.get("selected_jartic_id")
-    selected_jartic = next(
-        (
-            feature
-            for feature in [*jartic_lines, *jartic_areas]
-            if feature["jartic_id"] == selected_jartic_id
-        ),
-        None,
-    )
-    jartic_detail_panel(selected_jartic)
-    rows_by_id = {row["segment_id"]: row for row in enriched}
-    selected = rows_by_id.get(selected_id)
-    selected_segments = [
-        rows_by_id[segment_id]
-        for segment_id in st.session_state.get("selected_segment_ids", [])
-        if segment_id in rows_by_id
-    ]
-    edit_panel(store, selected, selected_segments)
+        selected_jartic_id = st.session_state.get("selected_jartic_id")
+        selected_jartic = next(
+            (
+                feature
+                for feature in [*jartic_lines, *jartic_areas]
+                if feature["jartic_id"] == selected_jartic_id
+            ),
+            None,
+        )
+        jartic_detail_panel(selected_jartic)
+        rows_by_id = {row["segment_id"]: row for row in enriched}
+        selected = rows_by_id.get(selected_id)
+        selected_segments = [
+            rows_by_id[segment_id]
+            for segment_id in st.session_state.get("selected_segment_ids", [])
+            if segment_id in rows_by_id
+        ]
+        edit_panel(store, selected, selected_segments)
 
     with st.expander("判定方法と制約"):
         st.markdown(

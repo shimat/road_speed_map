@@ -25,3 +25,4 @@ select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "scripts/*.py" = ["E402"]
+"road_speed_map/map_component.py" = ["E501"]
