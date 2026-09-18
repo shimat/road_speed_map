@@ -2,6 +2,23 @@
 
 このファイルを新しいCodexセッションの最初に読ませてください。コードはGitHubにありますが、**人間が入力した補正DBはGitに含まれません**。完全に引き継ぐには「Git clone」と「補正DBの別経路でのコピー」の両方が必要です。
 
+### 作成済みの一括移行ZIP
+
+現PCに `data/cache/road_speed_map_migration_2026-09-19.zip` を作成済み（322,533,773バイト、SHA-256: `d8dcda44240b0a858cd6db3e68ad5c77b2705bcdf2399fd9cd14b87e2c08d1e7`）。Gitには含まれないため、USBメモリ等の私的な経路で別PCへ運ぶ。このZIPには以下がリポジトリ相対パスで入っている。
+
+- `data/overrides.sqlite3`（SQLiteバックアップ機能で作成した一貫したコピー。速度補正307行・道路構造観測249行）
+- `data/processed/` の全12ファイル（札幌市周辺・旭川市周辺・函館市周辺の生成済み道路データ等）
+- `data/source/hokkaido-latest.osm.pbf`
+- `data/cache/jartic/` の2ファイル
+
+新PCでcloneと `uv sync --extra dev` を済ませ、**アプリをまだ起動していない状態で**、リポジトリのルートに展開する。例：
+
+```powershell
+Expand-Archive -LiteralPath "D:\transfer\road_speed_map_migration_2026-09-19.zip" -DestinationPath (Get-Location)
+```
+
+`D:\transfer\...` は実際の持ち込み先へ読み替える。新PCで既に補正を入力した場合はDBが競合するため、そのまま展開・上書きしない。ZIPを持ち出す前に旧PCで追加編集をした場合は、ZIPも作り直す必要がある。ZIPの中身とCRC、上記SHA-256は作成時に検証済み。新PCでも `Get-FileHash -Algorithm SHA256 <ZIPのパス>` で照合できる。
+
 ## 最優先で移すもの
 
 | 種類 | 現PCでの場所 | Git管理 | 新PCでの扱い |
