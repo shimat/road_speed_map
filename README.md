@@ -1,5 +1,7 @@
 # 道路最高速度マップ PoC
 
+別PCへの移行・新しいセッションへの引き継ぎは [MIGRATION_HANDOFF.md](MIGRATION_HANDOFF.md) を参照してください。特に手入力した補正DBはGitに含まれません。
+
 OpenStreetMapの道路網を、最高速度とその根拠・確度ごとに色分けするStreamlitアプリです。
 地図上の道路をクリックし、現地確認や写真などを根拠に手動補正できます。
 
